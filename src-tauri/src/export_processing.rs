@@ -463,17 +463,26 @@ fn process_image_for_export_pipeline(
     )
 }
 
-fn set_timestamps_from_exif(src: &Path, dst: &Path) {
+fn set_timestamps_from_exif(src: &Path, dst: &Path) -> bool {
     let capture_dt = exif_processing::get_creation_date_from_path(src);
 
+    // A non-positive Unix timestamp means the EXIF date was missing, zero,
+    // or pre-epoch (e.g. camera clock unset, sentinel "1970:01:01 00:00:00",
+    // or a parse that silently produced year 0). Fall back to the current
+    // time and signal the caller so it can notify the user once per batch.
     if capture_dt.timestamp() <= 0 {
+        log::warn!(
+            "EXIF capture date for '{}' is missing or invalid ({}); \
+             using export time as file timestamp",
+            src.display(),
+            capture_dt
+        );
         let now = filetime::FileTime::now();
         if let Err(e) = filetime::set_file_times(dst, now, now) {
             log::warn!("Could not set timestamps on '{}': {}", dst.display(), e);
         }
-        return;
+        return true;
     }
-
     let ft = filetime::FileTime::from_unix_time(
         capture_dt.timestamp(),
         capture_dt.timestamp_subsec_nanos(),
@@ -481,6 +490,7 @@ fn set_timestamps_from_exif(src: &Path, dst: &Path) {
     if let Err(e) = filetime::set_file_times(dst, ft, ft) {
         log::warn!("Could not set timestamps on '{}': {}", dst.display(), e);
     }
+    false
 }
 
 fn save_image_with_metadata(
@@ -772,7 +782,7 @@ fn export_masks_for_image(
             ensure_export_not_cancelled(cancellation_token)?;
 
             if export_settings.preserve_timestamps {
-                set_timestamps_from_exif(Path::new(source_path_str), &mask_image_path);
+                let _ = set_timestamps_from_exif(Path::new(source_path_str), &mask_image_path);
             }
 
             let alpha_bytes = encode_grayscale_to_png(&alpha_resized)?;
@@ -890,6 +900,7 @@ pub(crate) async fn export_images_impl(
 
     let context = Arc::new(context);
     let progress_counter = Arc::new(AtomicUsize::new(0));
+    let timestamp_fallback_used = Arc::new(AtomicBool::new(false));
 
     let available_cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -967,6 +978,7 @@ pub(crate) async fn export_images_impl(
             let app_handle_clone = app_handle.clone();
             let context_clone = Arc::clone(&context);
             let progress_counter_clone = Arc::clone(&progress_counter);
+            let timestamp_fallback_clone = Arc::clone(&timestamp_fallback_used);
             let output_folder_path = output_folder_path.to_path_buf();
             let base_origin_folders = base_origin_folders.clone();
             let export_settings = export_settings.clone();
@@ -1156,7 +1168,9 @@ pub(crate) async fn export_images_impl(
                     ensure_export_not_cancelled(&cancellation_token_clone)?;
 
                     if export_settings.preserve_timestamps {
-                        set_timestamps_from_exif(Path::new(&source_path_str), &output_path);
+                        if set_timestamps_from_exif(Path::new(&source_path_str), &output_path) {
+                            timestamp_fallback_clone.store(true, Ordering::SeqCst);
+                        }
                     }
                     ensure_export_not_cancelled(&cancellation_token_clone)?;
 
@@ -1241,6 +1255,14 @@ pub(crate) async fn export_images_impl(
                         serde_json::json!({ "current": total_paths, "total": total_paths, "path": "" }),
                     );
                     let _ = app_handle.emit("export-complete", ());
+                    if timestamp_fallback_used.load(Ordering::SeqCst) {
+                        let _ = app_handle.emit(
+                            "export-warning",
+                            "Some files were exported with the current time as the file \
+                             timestamp because their EXIF capture date was missing or \
+                             invalid. Check that your source files have a valid capture date.",
+                        );
+                    }
                 }
             },
         );
